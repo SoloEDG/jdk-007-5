@@ -1,4 +1,4 @@
-import type { Track, Instrument, Note, Session } from "@/shared/types";
+import type { Track, Instrument, Note, Session, AudioClip } from "@/shared/types";
 import { uid } from "@/shared/math";
 import { validateSession } from "../lib/validation";
 export function createArrangement() {
@@ -40,6 +40,31 @@ export function createArrangement() {
       tracks = [...tracks, t];
       selected = t.id;
       return t.id;
+    },
+    // 重采样完成后生成的新音频轨，默认保留全部源轨
+    addAudioTrack(clip: AudioClip) {
+      if (tracks.length >= 8)
+        throw new Error("最多支持 8 条轨道，请先移除一条");
+      const audioCount = tracks.filter((t) => t.instrument === "audio").length;
+      const t: Track = {
+        id: uid(),
+        name: `混音压轨 ${audioCount + 1}`,
+        instrument: "audio",
+        color: colors[tracks.length % colors.length],
+        notes: [],
+        clip,
+      };
+      tracks = [...tracks, t];
+      selected = t.id;
+      return t;
+    },
+    find(id: string) {
+      return tracks.find((t) => t.id === id) ?? null;
+    },
+    audioClips(): Map<string, AudioClip> {
+      const map = new Map<string, AudioClip>();
+      for (const t of tracks) if (t.clip) map.set(t.id, t.clip);
+      return map;
     },
     remove(id: string) {
       tracks = tracks.filter((t) => t.id !== id);

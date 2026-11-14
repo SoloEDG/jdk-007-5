@@ -31,6 +31,17 @@ export function createMixer() {
         channels[id] = { ...channels[id], muted: !channels[id].muted };
       sync();
     },
+    setMuted(id: string, muted: boolean) {
+      if (channels[id] && channels[id].muted !== muted)
+        channels[id] = { ...channels[id], muted };
+      sync();
+    },
+    beginResample(ids: readonly string[]) {
+      return buses.beginResample(ids);
+    },
+    endResample() {
+      buses.endResample();
+    },
     master(value: number) {
       master = level(value);
       sync();

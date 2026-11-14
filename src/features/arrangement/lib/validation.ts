@@ -1,8 +1,26 @@
-import type { Session, Track, Note } from "@/shared/types";
+import type { Session, Track, Note, AudioClip } from "@/shared/types";
 const object = (x: unknown): x is Record<string, unknown> =>
   !!x && typeof x === "object" && !Array.isArray(x);
 const finite = (x: unknown, min: number, max: number): x is number =>
   typeof x === "number" && Number.isFinite(x) && x >= min && x <= max;
+
+const validateClip = (raw: unknown): AudioClip => {
+  if (!object(raw)) throw new Error("音频片段损坏");
+  const c = raw as unknown as AudioClip;
+  if (
+    !finite(c.sampleRate, 2000, 192000) ||
+    c.channels !== 2 ||
+    !Array.isArray(c.pcm) ||
+    c.pcm.length === 0 ||
+    c.pcm.some((p) => typeof p !== "string") ||
+    !Number.isInteger(c.frames) ||
+    c.frames <= 0 ||
+    !finite(c.beats, 0.01, 32) ||
+    !finite(c.sourceBpm, 40, 220)
+  )
+    throw new Error("音频片段数据无效");
+  return structuredClone(c);
+};
 export function validateSession(raw: unknown): Session {
   if (
     !object(raw) ||
@@ -28,13 +46,19 @@ export function validateSession(raw: unknown): Session {
       !t.id ||
       typeof t.name !== "string" ||
       t.name.length > 32 ||
-      !["drums", "keys"].includes(t.instrument) ||
+      !["drums", "keys", "audio"].includes(t.instrument) ||
       !/^#[0-9a-f]{6}$/i.test(t.color) ||
       !Array.isArray(t.notes) ||
       t.notes.length > 2048
     )
       throw new Error("轨道数据无效");
     ids.add(t.id);
+    if (t.instrument === "audio") {
+      if (!t.clip) throw new Error("音频轨缺少波形");
+      validateClip(t.clip);
+    } else if (t.clip) {
+      throw new Error("音符轨道不能携带音频片段");
+    }
     for (const n of t.notes as Note[]) {
       if (
         !object(n) ||

@@ -4,11 +4,14 @@ import { Pads, Keyboard } from "@/features/instruments";
 import { Timeline, TrackActions } from "@/features/arrangement";
 import { RecordControls, RecordingStatus } from "@/features/recorder";
 import { MixerPanel } from "@/features/mixer";
+import { ResamplePanel } from "@/features/resample";
 export function App() {
   const s = useStudio();
   if (!s) return <div className="loading">正在打开夜航工作室…</div>;
   const v = s.view(),
-    locked = v.recorder.status !== "idle";
+    locked =
+      v.recorder.status !== "idle" || v.resample.status !== "idle";
+  const hasBounce = v.arrangement.tracks.some((t) => t.instrument === "audio");
   return (
     <div className="studio-shell">
       <aside className="rail">
@@ -129,13 +132,21 @@ export function App() {
             </div>
             <div className="instrument-label">
               <span>
-                {v.selected?.instrument === "keys"
-                  ? "柔和三角波 / WARM TRIANGLE"
-                  : "经典合成鼓组 / ANALOG KIT"}
+                {v.selected?.instrument === "audio"
+                  ? "重采样循环 / RESAMPLED LOOP"
+                  : v.selected?.instrument === "keys"
+                    ? "柔和三角波 / WARM TRIANGLE"
+                    : "经典合成鼓组 / ANALOG KIT"}
               </span>
               <span>鼠标 · 触控 · 键盘</span>
             </div>
-            {v.selected?.instrument === "keys" ? (
+            {v.selected?.instrument === "audio" ? (
+              <div className="audio-track-note">
+                <span>◉</span>
+                <p>这是一条重采样生成的音频循环，随拍点自动播放。</p>
+                <small>可在混音台调整音量与静音，或用「内部重采样」继续叠加。</small>
+              </div>
+            ) : v.selected?.instrument === "keys" ? (
               <Keyboard active={v.active} down={s.down} up={s.up} />
             ) : (
               <Pads active={v.active} down={s.down} up={s.up} />
@@ -145,6 +156,17 @@ export function App() {
               absolute={v.transport.absolute}
             />
           </section>
+          <ResamplePanel
+            tracks={v.arrangement.tracks}
+            view={v.resample}
+            absolute={v.transport.absolute}
+            canBounce={v.arrangement.tracks.length < 8}
+            hasBounce={hasBounce}
+            toggleSource={s.toggleResampleSource}
+            resample={() => void s.resample()}
+            toggleMonitor={s.toggleMonitor}
+            cancel={s.cancel}
+          />
         </div>
         <footer>
           <span role="status">{v.message}</span>

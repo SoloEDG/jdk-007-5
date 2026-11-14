@@ -8,14 +8,21 @@ import {
   loadSession,
 } from "@/features/arrangement";
 import { createMixer } from "@/features/mixer";
+import { createResampler } from "@/features/resample";
+import { createAudioPlayer } from "@/features/audio";
+import { encodeClip } from "@/features/resample/lib/pcm";
 import type { NoteInput, Instrument, Session } from "@/shared/types";
 export function createStudio(notify: () => void) {
   const engine = createEngine(),
     transport = createTransport(),
     recorder = createRecorder(),
     arrangement = createArrangement(),
-    mixer = createMixer();
+    mixer = createMixer(),
+    resampler = createResampler(),
+    player = createAudioPlayer();
   const active = new Set<string>();
+  // 最近一次重采样的源轨与生成的音频轨，用于监听切换时不叠加
+  let lastBounce: { sources: string[]; audioId: string } | null = null;
   let message = "欢迎来到夜航。戴上耳机，试着敲下第一拍。",
     epoch = 0,
     disposed = false;
@@ -40,10 +47,18 @@ export function createStudio(notify: () => void) {
     engine.cancel();
     active.clear();
   };
+  // 绝对拍点 -> AudioContext 时间，仅在播放时有意义
+  const timeAtBeat = (beat: number) => {
+    const view = transport.view(now());
+    return now() + ((beat - view.absolute) * 60) / view.bpm;
+  };
   const stop = () => {
     epoch++;
     transport.stop();
     recorder.cancel();
+    resampler.cancel();
+    mixer.endResample();
+    player.stop();
     cancelVoices();
     notify();
   };
@@ -51,27 +66,56 @@ export function createStudio(notify: () => void) {
     epoch++;
     transport.pause(now());
     recorder.cancel();
+    resampler.cancel();
+    mixer.endResample();
+    player.stop();
     cancelVoices();
-    feedback("播放已暂停；未完成录音已取消，原片段保留。");
+    feedback("播放已暂停；未完成的录音与重采样已取消，原片段保留。");
   };
   const unlock = async () => {
     const context = await engine.unlock();
-    if (disposed) return false;
+    if (disposed) return null;
     mixer.attach(context);
     syncMixer();
     engine.route(mixer.channel);
-    return true;
+    player.attach(context, mixer.channel);
+    return context;
   };
   const play = async () => {
     const token = ++epoch;
     try {
       if (!(await unlock()) || token !== epoch) return;
-      transport.start(now() + 0.02);
+      const startAt = now() + 0.02;
+      const view = transport.view(now());
+      transport.start(startAt);
+      player.start(
+        arrangement.audioClips(),
+        startAt,
+        view.absolute,
+        view.bpm,
+      );
       tick();
       notify();
     } catch {
       feedback("声音启动失败，请再次点击播放");
     }
+  };
+  const finishBounce = (
+    samples: Float32Array,
+    rate: number,
+    beats: number,
+    bpm: number,
+    participants: readonly string[],
+  ) => {
+    const clip = encodeClip(samples, rate, beats, bpm);
+    const track = arrangement.addAudioTrack(clip);
+    syncMixer();
+    // 默认压轨：源轨静音，新音频轨承担这一层，避免两份声音叠加
+    for (const id of participants) mixer.setMuted(id, true);
+    lastBounce = { sources: [...participants], audioId: track.id };
+    const current = transport.view(now());
+    player.add(track.id, clip, current, now());
+    message = `重采样完成 · 已生成循环音频轨「${track.name}」，源轨已保留并静音`;
   };
   const tick = () => {
     const time = now(),
@@ -82,6 +126,21 @@ export function createStudio(notify: () => void) {
         arrangement.commit(take.trackId, take.notes);
         message = `录制完成 · ${take.notes.length} 个音符`;
       });
+    if (resampler.isActive()) {
+      const participants = [...resampler.snapshot().participants];
+      const bounce = resampler.advance(view.absolute, time);
+      if (bounce)
+        guard(() => {
+          mixer.endResample();
+          finishBounce(
+            bounce.samples,
+            bounce.sampleRate,
+            bounce.beats,
+            bounce.sourceBpm,
+            participants,
+          );
+        });
+    }
     const capture = recorder.snapshot();
     const ceiling =
       capture.status === "idle" ? Infinity : capture.start + capture.length;
@@ -138,6 +197,9 @@ export function createStudio(notify: () => void) {
     const valid = arrangement.restore(session);
     transport.configure(valid.bpm, valid.beats);
     mixer.restore(valid.channels, valid.master);
+    resampler.prune(valid.tracks.map((t) => t.id));
+    player.reset();
+    lastBounce = null;
     notify();
   };
   const timer = window.setInterval(() => {
@@ -168,6 +230,7 @@ export function createStudio(notify: () => void) {
         arrangement: arrangement.snapshot(),
         selected: arrangement.selected(),
         recorder: recorder.snapshot(),
+        resample: resampler.snapshot(),
         mixer: mixer.snapshot(),
         active: new Set(active),
         message,
@@ -182,6 +245,7 @@ export function createStudio(notify: () => void) {
       stop();
       transport.configure(bpm, beats);
       arrangement.resizeLoop(transport.view(now()).beats);
+      player.setTempo(transport.view(now()).bpm);
       feedback("速度或长度变更：播放回到起点；缩短时移除范围外音符。");
     },
     add(kind: Instrument) {
@@ -192,6 +256,7 @@ export function createStudio(notify: () => void) {
     },
     select(id: string) {
       if (recorder.snapshot().status !== "idle") return;
+      if (resampler.isActive()) return;
       engine.releaseHeld();
       active.clear();
       arrangement.select(id);
@@ -203,7 +268,9 @@ export function createStudio(notify: () => void) {
         if (selected) {
           stop();
           arrangement.remove(selected.id);
+          player.remove(selected.id);
           syncMixer();
+          resampler.prune(arrangement.snapshot().tracks.map((t) => t.id));
         }
       });
     },
@@ -219,11 +286,28 @@ export function createStudio(notify: () => void) {
     async record() {
       const selected = arrangement.selected();
       if (!selected) return;
+      if (selected.instrument === "audio") {
+        feedback("音频轨由波形构成，请选择鼓组或琴键轨道演奏");
+        return;
+      }
+      if (resampler.isActive()) {
+        feedback("正在重采样，请先完成或取消本次采集");
+        return;
+      }
       const token = ++epoch;
       try {
         if (!(await unlock()) || token !== epoch) return;
         const state = transport.view(now());
-        if (!state.running) transport.start(now() + 0.02);
+        if (!state.running) {
+          const startAt = now() + 0.02;
+          transport.start(startAt);
+          player.start(
+            arrangement.audioClips(),
+            startAt,
+            transport.view(now()).absolute,
+            state.bpm,
+          );
+        }
         recorder.arm(
           selected.id,
           selected.instrument,
@@ -237,6 +321,13 @@ export function createStudio(notify: () => void) {
       }
     },
     cancel() {
+      if (resampler.isActive()) {
+        resampler.cancel();
+        mixer.endResample();
+        feedback("本次重采样已取消，未完成音频丢弃，已有片段保留。");
+        notify();
+        return;
+      }
       recorder.cancel();
       feedback("本次录音已取消，之前的片段仍然保留。");
     },
@@ -256,6 +347,85 @@ export function createStudio(notify: () => void) {
       mixer.master(n);
       notify();
     },
+    toggleResampleSource(id: string) {
+      // 采集期间调整参与范围会被忽略，冻结到下一次，保证同一圈来源一致
+      if (resampler.isActive()) return;
+      resampler.toggle(id);
+      notify();
+    },
+    async resample() {
+      if (resampler.isActive() || recorder.snapshot().status !== "idle") return;
+      const chosen = resampler.snapshot().participants;
+      if (chosen.length === 0) {
+        feedback("请先勾选至少一条参与重采样的轨道");
+        return;
+      }
+      if (arrangement.snapshot().tracks.length >= 8) {
+        feedback("轨道已达 8 条上限，请先移除一条再压轨");
+        return;
+      }
+      const token = ++epoch;
+      try {
+        const ctx = await unlock();
+        if (!ctx || token !== epoch) return;
+        let state = transport.view(now());
+        if (!state.running) {
+          const startAt = now() + 0.02;
+          transport.start(startAt);
+          player.start(
+            arrangement.audioClips(),
+            startAt,
+            transport.view(now()).absolute,
+            state.bpm,
+          );
+          state = transport.view(now());
+        }
+        // 抽头接在各声道音量/静音增益之后，实际电平决定录入结果
+        const tap = mixer.beginResample(chosen);
+        await resampler.arm(
+          ctx,
+          tap,
+          arrangement.snapshot().tracks.map((t) => t.id),
+          state.absolute,
+          state.beats,
+          state.bpm,
+          timeAtBeat,
+        );
+        tick();
+        notify();
+      } catch (error) {
+        mixer.endResample();
+        resampler.cancel();
+        feedback(
+          error instanceof Error
+            ? `重采样启动失败：${error.message}`
+            : "重采样启动失败，请重试",
+        );
+      }
+    },
+    // 在「源轨」与「压轨结果」之间切换监听，互斥静音避免两份声音叠加
+    toggleMonitor() {
+      if (!lastBounce) return;
+      const { sources, audioId } = lastBounce;
+      const alive = new Set(arrangement.snapshot().tracks.map((t) => t.id));
+      if (!alive.has(audioId)) {
+        lastBounce = null;
+        feedback("对应的压轨已删除，无法切换监听");
+        return;
+      }
+      const channels = mixer.snapshot().channels;
+      const audioMuted = channels[audioId]?.muted ?? false;
+      if (audioMuted) {
+        mixer.setMuted(audioId, false);
+        for (const id of sources) if (alive.has(id)) mixer.setMuted(id, true);
+        feedback("正在监听压轨结果，源轨保持静音");
+      } else {
+        mixer.setMuted(audioId, true);
+        for (const id of sources) if (alive.has(id)) mixer.setMuted(id, false);
+        feedback("正在监听源轨，压轨结果已静音，可继续叠加演奏");
+      }
+      notify();
+    },
     demo() {
       guard(() => {
         install(demoSession());
@@ -266,6 +436,8 @@ export function createStudio(notify: () => void) {
       guard(() => {
         if (recorder.snapshot().status !== "idle")
           throw new Error("请完成或取消录音后再保存");
+        if (resampler.isActive())
+          throw new Error("请完成或取消重采样后再保存");
         const a = arrangement.snapshot(),
           t = transport.view(now()),
           m = mixer.snapshot();
@@ -295,6 +467,8 @@ export function createStudio(notify: () => void) {
       unbind();
       window.removeEventListener("keydown", shortcut);
       window.removeEventListener("blur", blur);
+      resampler.dispose();
+      player.dispose();
       mixer.dispose();
       engine.dispose();
     },
